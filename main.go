@@ -61,11 +61,11 @@ func loggedCommand(name string, args ...string) *exec.Cmd {
 
 // Config represents the .lazycrypt/config.yml file.
 type Config struct {
-	Version         int            `yaml:"version"`
-	CurrentKey      string         `yaml:"current_key"`
-	EncryptedRemote RemoteConfig   `yaml:"encrypted_remote"`
-	ExcludePatterns []string       `yaml:"exclude_patterns"`
-	RetiredKeys     []RetiredKey   `yaml:"retired_keys"`
+	Version         int          `yaml:"version"`
+	CurrentKey      string       `yaml:"current_key"`
+	EncryptedRemote RemoteConfig `yaml:"encrypted_remote"`
+	ExcludePatterns []string     `yaml:"exclude_patterns"`
+	RetiredKeys     []RetiredKey `yaml:"retired_keys"`
 }
 
 // RemoteConfig holds the name and URL of the encrypted git remote.
@@ -1036,12 +1036,12 @@ func (m model) performSync() tea.Cmd {
 
 // commitMetaInfo holds author, committer, and date information extracted from a git commit.
 type commitMetaInfo struct {
-	message       string
-	author        string
-	date          string
-	committerName string
+	message        string
+	author         string
+	date           string
+	committerName  string
 	committerEmail string
-	committerDate string
+	committerDate  string
 }
 
 // getCommitMetaInfo extracts commit message, author, committer, and date from
@@ -1812,8 +1812,12 @@ func (m model) renderMain() string {
 	eInner := encryptedH - 3
 	clInner := cmdLogH - 3
 
-	plaintextPanel := m.renderPanel("Plaintext Commits", m.renderPlaintextList(pInner, leftW-4), leftW-2, plaintextH, panelPlaintext)
-	encryptedPanel := m.renderPanel("Encrypted Commits", m.renderEncryptedList(eInner, leftW-4), leftW-2, encryptedH, panelEncrypted)
+	unsynced := total - syncedN
+	plaintextTitle := fmt.Sprintf("Plaintext Commits (%d)", total)
+	encryptedTitle := fmt.Sprintf("Encrypted Commits (%d - %d unsynced)", len(m.encryptedCommits), unsynced)
+
+	plaintextPanel := m.renderPanel(plaintextTitle, m.renderPlaintextList(pInner, leftW-4), leftW-2, plaintextH, panelPlaintext)
+	encryptedPanel := m.renderPanel(encryptedTitle, m.renderEncryptedList(eInner, leftW-4), leftW-2, encryptedH, panelEncrypted)
 	cmdLogPanel := m.renderPanel("Command Log", m.renderCommandLog(clInner, leftW-4), leftW-2, cmdLogH, -1)
 
 	leftCol := lipgloss.JoinVertical(lipgloss.Left, plaintextPanel, encryptedPanel, cmdLogPanel)
