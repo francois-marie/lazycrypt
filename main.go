@@ -294,14 +294,14 @@ func reverseCommits(commits []Commit) {
 }
 
 func getFilesForCommit(sha string) []FileChange {
-	out, err := loggedCommand("git", "diff-tree", "--no-commit-id", "-r", "--name-status", sha).Output()
-	if err != nil || strings.TrimSpace(string(out)) == "" {
-		out, err = loggedCommand("git", "diff-tree", "--root", "--no-commit-id", "-r", "--name-status", sha).Output()
+	out, err := loggedCommand("git", "diff-tree", "--no-commit-id", "-r", "--name-status", "-z", sha).Output()
+	if err != nil || len(out) == 0 {
+		out, err = loggedCommand("git", "diff-tree", "--root", "--no-commit-id", "-r", "--name-status", "-z", sha).Output()
 		if err != nil {
 			return nil
 		}
 	}
-	return parseFileChanges(string(out))
+	return parseNameStatusZ(out)
 }
 
 func parseFileChanges(output string) []FileChange {
@@ -314,6 +314,50 @@ func parseFileChanges(output string) []FileChange {
 		if len(parts) >= 2 {
 			files = append(files, FileChange{Status: parts[0], Path: parts[1]})
 		}
+	}
+	return files
+}
+
+// parseNameStatusZ parses "git diff-tree --name-status -z" output into
+// FileChange entries. The output is a NUL-separated stream of tokens:
+//
+//	status NUL path NUL [path2 NUL] status NUL path NUL ...
+//
+// For renames/copies (Rn or Cn) there is an extra path token; in that case we
+// treat the second path as the new path.
+func parseNameStatusZ(output []byte) []FileChange {
+	if len(output) == 0 {
+		return nil
+	}
+	var files []FileChange
+	tokens := bytes.Split(output, []byte{0})
+	// Drop possible trailing empty token from final NUL.
+	if len(tokens) > 0 && len(tokens[len(tokens)-1]) == 0 {
+		tokens = tokens[:len(tokens)-1]
+	}
+	for i := 0; i < len(tokens); {
+		status := string(tokens[i])
+		i++
+		if status == "" {
+			continue
+		}
+		if i >= len(tokens) {
+			break
+		}
+		path := string(tokens[i])
+		i++
+		// Renames / copies have an extra "old-path" token; use the new path.
+		if len(status) > 0 && (status[0] == 'R' || status[0] == 'C') {
+			if i >= len(tokens) {
+				break
+			}
+			path = string(tokens[i])
+			i++
+		}
+		if path == "" {
+			continue
+		}
+		files = append(files, FileChange{Status: status, Path: path})
 	}
 	return files
 }
@@ -1029,8 +1073,19 @@ func getCommitMetaInfo(sha string, repoArgs ...string) (commitMetaInfo, error) {
 }
 
 // gitCommitInRepo stages all changes and creates a commit in the given repo,
-// preserving the original author, committer, and date.
+// preserving the original author, committer, and date. Uses explicit
+// --git-dir and --work-tree so the bare repo and work tree are unambiguous
+// (avoids issues with multiple files or env not propagating to child process).
 func gitCommitInRepo(workDir, gitDir string, meta commitMetaInfo, envExtra ...string) (string, error) {
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve work dir: %w", err)
+	}
+	absGitDir, err := filepath.Abs(gitDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve git dir: %w", err)
+	}
+
 	env := append(os.Environ(), envExtra...)
 	if meta.committerName != "" {
 		env = append(env, "GIT_COMMITTER_NAME="+meta.committerName)
@@ -1042,14 +1097,14 @@ func gitCommitInRepo(workDir, gitDir string, meta commitMetaInfo, envExtra ...st
 		env = append(env, "GIT_COMMITTER_DATE="+meta.committerDate)
 	}
 
-	addCmd := loggedCommand("git", "add", "-A")
-	addCmd.Dir = workDir
+	addArgs := []string{"--git-dir=" + absGitDir, "--work-tree=" + absWorkDir, "add", "-A"}
+	addCmd := loggedCommand("git", addArgs...)
 	addCmd.Env = env
 	if out, err := addCmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git add: %s: %w", string(out), err)
 	}
 
-	commitArgs := []string{"commit", "--allow-empty", "-m", meta.message}
+	commitArgs := []string{"--git-dir=" + absGitDir, "--work-tree=" + absWorkDir, "commit", "--allow-empty", "-m", meta.message}
 	if meta.author != "" {
 		commitArgs = append(commitArgs, "--author", meta.author)
 	}
@@ -1057,14 +1112,13 @@ func gitCommitInRepo(workDir, gitDir string, meta commitMetaInfo, envExtra ...st
 		commitArgs = append(commitArgs, "--date", meta.date)
 	}
 	commitCmd := loggedCommand("git", commitArgs...)
-	commitCmd.Dir = workDir
 	commitCmd.Env = env
 	if out, err := commitCmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git commit: %s: %w", string(out), err)
 	}
 
 	shaCmd := loggedCommand("git", "rev-parse", "HEAD")
-	shaCmd.Env = append(os.Environ(), "GIT_DIR="+gitDir)
+	shaCmd.Env = append(os.Environ(), "GIT_DIR="+absGitDir)
 	shaOut, err := shaCmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("rev-parse: %w", err)
@@ -1098,7 +1152,14 @@ func syncOneCommit(sha, encRepoPath, pubKey string, cm *CommitMap, excludePatter
 		cmd.Dir = tmpDir
 		cmd.Env = append(os.Environ(), gitEnv...)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			return "", fmt.Errorf("checkout parent: %s: %w", string(out), err)
+			msg := string(out)
+			// Tolerate "did not match any file(s)" errors: this happens
+			// when the parent encrypted commit has an empty tree (e.g. all
+			// files were excluded). The checkout is best-effort; we'll
+			// overwrite the work tree with encrypted blobs next anyway.
+			if !strings.Contains(msg, "did not match any file(s) known to git") {
+				return "", fmt.Errorf("checkout parent: %s: %w", msg, err)
+			}
 		}
 	}
 
@@ -1108,25 +1169,25 @@ func syncOneCommit(sha, encRepoPath, pubKey string, cm *CommitMap, excludePatter
 		return "", fmt.Errorf("diff-tree: %w", err)
 	}
 
-	for _, line := range strings.Split(strings.TrimSpace(string(diffOut)), "\n") {
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		filePath := fields[1]
-
+	changes := parseNameStatusZ(diffOut)
+	for _, change := range changes {
+		filePath := change.Path
 		if matchesExcludePattern(filePath, excludePatterns) {
 			continue
 		}
 
-		switch fields[0][0] {
-		case 'A', 'M':
-			content, err := loggedCommand("git", "show", sha+":"+filePath).Output()
+		if change.Status == "" {
+			continue
+		}
+		switch change.Status[0] {
+		case 'A', 'M', 'R':
+			content, err := readBlobAtCommit(sha, filePath)
+			if err == errSubmoduleEntry {
+				logCmd("skipping submodule entry: %s", filePath)
+				continue
+			}
 			if err != nil {
-				return "", fmt.Errorf("git show %s:%s: %w", sha, filePath, err)
+				return "", fmt.Errorf("read blob %s at %s: %w", filePath, sha, err)
 			}
 			encrypted, err := ageEncrypt(content, pubKey)
 			if err != nil {
@@ -1153,13 +1214,81 @@ func syncOneCommit(sha, encRepoPath, pubKey string, cm *CommitMap, excludePatter
 	return gitCommitInRepo(tmpDir, encRepoPath, meta, gitEnv...)
 }
 
+// readBlobAtCommit returns the contents of filePath as of commit sha.
+// It first resolves the blob ID with ls-tree + cat-file (robust for unusual
+// filenames), and falls back to "git show sha:path" if needed.
+// Returns nil, errSubmoduleEntry when the path is a submodule pointer.
+func readBlobAtCommit(sha, filePath string) ([]byte, error) {
+	blobID, err := getBlobIDForPath(sha, filePath)
+	if err == errSubmoduleEntry {
+		return nil, errSubmoduleEntry
+	}
+	if err == nil {
+		out, blobErr := loggedCommand("git", "cat-file", "blob", blobID).Output()
+		if blobErr == nil {
+			return out, nil
+		}
+		if exitErr, ok := blobErr.(*exec.ExitError); ok {
+			err = fmt.Errorf("git cat-file blob %s: %s", blobID, strings.TrimSpace(string(exitErr.Stderr)))
+		} else {
+			err = fmt.Errorf("git cat-file blob %s: %w", blobID, blobErr)
+		}
+	}
+
+	showOut, showErr := loggedCommand("git", "show", sha+":"+filePath).Output()
+	if showErr == nil {
+		return showOut, nil
+	}
+	if exitErr, ok := showErr.(*exec.ExitError); ok {
+		return nil, fmt.Errorf("%v; git show %s:%s: %s", err, sha, filePath, strings.TrimSpace(string(exitErr.Stderr)))
+	}
+	return nil, fmt.Errorf("%v; git show %s:%s: %w", err, sha, filePath, showErr)
+}
+
+// errSubmoduleEntry is returned when a path refers to a submodule (type "commit")
+// rather than a regular file blob. Callers should skip the entry instead of failing.
+var errSubmoduleEntry = fmt.Errorf("path is a submodule entry")
+
+// getBlobIDForPath resolves the blob object ID for path at the given commit.
+// It uses "git ls-tree -z <sha> -- <path>" and parses the first (and only)
+// entry, which is safe even for paths with spaces or other special characters.
+// Returns errSubmoduleEntry when the entry's object type is "commit" (submodule).
+func getBlobIDForPath(sha, path string) (string, error) {
+	out, err := loggedCommand("git", "ls-tree", "-z", sha, "--", path).Output()
+	if err != nil {
+		return "", fmt.Errorf("git ls-tree: %w", err)
+	}
+	if len(out) == 0 {
+		return "", fmt.Errorf("path %q not found in commit %s", path, sha)
+	}
+	parts := bytes.SplitN(out, []byte{0}, 2)
+	line := parts[0]
+	if len(line) == 0 {
+		return "", fmt.Errorf("empty ls-tree output for %s %q", sha, path)
+	}
+	metaAndPath := bytes.SplitN(line, []byte("\t"), 2)
+	if len(metaAndPath) != 2 {
+		return "", fmt.Errorf("unexpected ls-tree line: %q", string(line))
+	}
+	// Fields: <mode> <type> <hash>
+	metaFields := strings.Fields(string(metaAndPath[0]))
+	if len(metaFields) < 3 {
+		return "", fmt.Errorf("unexpected ls-tree meta: %q", metaAndPath[0])
+	}
+	objType := metaFields[1]
+	if objType == "commit" {
+		return "", errSubmoduleEntry
+	}
+	return metaFields[2], nil
+}
+
 // getCommitDiffTree returns the name-status output for a commit.
 func getCommitDiffTree(sha string, isRoot bool, repoArgs ...string) ([]byte, error) {
 	args := append(repoArgs, "diff-tree")
 	if isRoot {
 		args = append(args, "--root")
 	}
-	args = append(args, "--no-commit-id", "-r", "--name-status", sha)
+	args = append(args, "--no-commit-id", "-r", "--name-status", "-z", sha)
 	return loggedCommand("git", args...).Output()
 }
 
@@ -1274,18 +1403,14 @@ func decryptOneCommit(encSHA, encRepoPath, keyPath, repoPath string) (string, er
 	var toWrite []pendingFile
 	var toDelete []string
 
-	for _, line := range strings.Split(strings.TrimSpace(string(diffOut)), "\n") {
-		if line == "" {
+	changes := parseNameStatusZ(diffOut)
+	for _, change := range changes {
+		filePath := change.Path
+		if change.Status == "" {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		filePath := fields[1]
-
-		switch fields[0][0] {
-		case 'A', 'M':
+		switch change.Status[0] {
+		case 'A', 'M', 'R':
 			content, err := loggedCommand("git", "-C", encRepoPath, "show", encSHA+":"+filePath).Output()
 			if err != nil {
 				return "", fmt.Errorf("git show %s:%s: %w", encSHA, filePath, err)

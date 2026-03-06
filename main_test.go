@@ -189,6 +189,27 @@ func TestParseFileChangesEmpty(t *testing.T) {
 	}
 }
 
+func TestParseNameStatusZ(t *testing.T) {
+	// Simulate output from: git diff-tree --name-status -z
+	// A	src/simple.go
+	// M	src/with space.go
+	// R100	src/old.go -> src/new.go
+	data := []byte("A\x00src/simple.go\x00M\x00src/with space.go\x00R100\x00src/old.go\x00src/new.go\x00")
+	files := parseNameStatusZ(data)
+	if len(files) != 3 {
+		t.Fatalf("expected 3 file changes, got %d", len(files))
+	}
+	if files[0].Status != "A" || files[0].Path != "src/simple.go" {
+		t.Errorf("unexpected files[0]: %+v", files[0])
+	}
+	if files[1].Status != "M" || files[1].Path != "src/with space.go" {
+		t.Errorf("unexpected files[1]: %+v", files[1])
+	}
+	if files[2].Status != "R100" || files[2].Path != "src/new.go" {
+		t.Errorf("unexpected files[2]: %+v", files[2])
+	}
+}
+
 // --- CommitMap tests ---
 
 func TestCommitMapInMemory(t *testing.T) {
