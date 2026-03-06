@@ -32,6 +32,14 @@ var (
 	globalCmdLogMu sync.Mutex
 )
 
+// syncPauseMu guards syncPaused and syncResumeCh. When sync is paused, the sync
+// goroutine blocks on <-syncResumeCh until the user resumes (press P again).
+var (
+	syncPauseMu  sync.Mutex
+	syncPaused   bool
+	syncResumeCh chan struct{}
+)
+
 func logCmd(format string, args ...interface{}) {
 	globalCmdLogMu.Lock()
 	defer globalCmdLogMu.Unlock()
@@ -570,26 +578,28 @@ const (
 )
 
 type model struct {
-	activePanel      panel
-	selected         [panelCount]int
-	plaintextCommits []Commit
-	encryptedCommits []Commit
-	files            []FileChange
-	commitDiff       string
-	commitMeta       string
-	keys             []Key
-	remotes          []Remote
-	config           Config
-	commitMap        *CommitMap
-	prereqs          PrereqStatus
-	width            int
-	height           int
-	showHelp         bool
-	statusMsg        string
-	confirmRekey     bool
-	syncing          bool
-	diffScroll       int
-	commandLog       []string
+	activePanel        panel
+	selected           [panelCount]int
+	plaintextCommits   []Commit
+	encryptedCommits   []Commit
+	files              []FileChange
+	commitDiff         string
+	commitMeta         string
+	keys               []Key
+	remotes            []Remote
+	config             Config
+	commitMap          *CommitMap
+	prereqs            PrereqStatus
+	width              int
+	height             int
+	showHelp           bool
+	statusMsg          string
+	confirmRekey       bool
+	syncing            bool
+	syncProgressSynced int
+	syncProgressTotal  int
+	diffScroll         int
+	commandLog         []string
 
 	showRemoteInput bool
 	remoteInputStep int
@@ -604,6 +614,15 @@ type model struct {
 type initFinishedMsg struct {
 	err    error
 	output string
+}
+
+// syncProgressMsg is sent during sync so the UI can refresh panels and show ETA.
+// NextCh is the channel to wait on for the next message (progress or syncFinishedMsg).
+type syncProgressMsg struct {
+	NextCh    chan tea.Msg
+	Synced    int
+	Total     int
+	StartTime time.Time
 }
 
 type syncFinishedMsg struct {
@@ -709,6 +728,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = "Initialized lazycrypt"
 		}
 		return m, m.reloadData()
+
+	case syncProgressMsg:
+		m.syncProgressSynced = msg.Synced
+		m.syncProgressTotal = msg.Total
+		m.plaintextCommits = getPlaintextCommits()
+		m.encryptedCommits = getEncryptedCommits()
+		m.commitMap = loadCommitMap(commitMapPath())
+		if len(m.plaintextCommits) > 0 {
+			idx := m.selected[panelPlaintext]
+			if idx >= len(m.plaintextCommits) {
+				idx = 0
+			}
+			sha := m.plaintextCommits[idx].SHA
+			m.files = getFilesForCommit(sha)
+			m.commitMeta = getCommitMeta(sha)
+			m.commitDiff = getCommitDiff(sha)
+		}
+		syncPauseMu.Lock()
+		paused := syncPaused
+		syncPauseMu.Unlock()
+		if paused {
+			m.statusMsg = fmt.Sprintf("Syncing %d/%d (paused) - press P to resume", msg.Synced, msg.Total)
+		} else {
+			m.statusMsg = formatSyncProgress(msg.Synced, msg.Total, msg.StartTime)
+		}
+		return m, waitForSyncMsg(msg.NextCh)
 
 	case syncFinishedMsg:
 		m.syncing = false
@@ -824,6 +869,26 @@ func (m model) handleKeypress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.performInit()
 		}
 		m.statusMsg = "Already initialized"
+		return m, nil
+
+	case key.Matches(msg, key.NewBinding(key.WithKeys("P"))):
+		if m.syncing {
+			syncPauseMu.Lock()
+			if syncPaused {
+				syncPaused = false
+				resumeCh := syncResumeCh
+				syncPauseMu.Unlock()
+				if resumeCh != nil {
+					resumeCh <- struct{}{}
+				}
+				m.statusMsg = fmt.Sprintf("Syncing %d/%d (resumed)", m.syncProgressSynced, m.syncProgressTotal)
+			} else {
+				syncPaused = true
+				syncPauseMu.Unlock()
+				m.statusMsg = fmt.Sprintf("Syncing %d/%d (paused) - press P to resume", m.syncProgressSynced, m.syncProgressTotal)
+			}
+			return m, nil
+		}
 		return m, nil
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("s"))):
@@ -988,50 +1053,97 @@ func addToGitignore(pattern string) error {
 	return err
 }
 
-func (m model) performSync() tea.Cmd {
+// waitForSyncMsg returns a Cmd that blocks on the channel until the next sync message.
+func waitForSyncMsg(ch chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
-		pubKey := getPublicKey(currentKeyPath())
-		if pubKey == "" {
-			return syncFinishedMsg{err: fmt.Errorf("no public key found in %s", currentKeyPath())}
-		}
-
-		cfg, err := loadConfig()
-		if err != nil {
-			return syncFinishedMsg{err: fmt.Errorf("load config: %w", err)}
-		}
-		cm := loadCommitMap(commitMapPath())
-
-		out, err := loggedCommand("git", "log", "--format=%H", "--reverse").Output()
-		if err != nil {
-			return syncFinishedMsg{err: fmt.Errorf("git log: %w", err)}
-		}
-
-		shas := splitNonEmpty(string(out))
-		synced := 0
-		absEncRepo, err := filepath.Abs(encryptedRepoPath())
-		if err != nil {
-			return syncFinishedMsg{err: fmt.Errorf("resolve encrypted repo path: %w", err)}
-		}
-
-		for _, sha := range shas {
-			if cm.isSynced(sha) {
-				continue
-			}
-			encSHA, err := syncOneCommit(sha, absEncRepo, pubKey, cm, cfg.ExcludePatterns)
-			if err != nil {
-				cm.save()
-				return syncFinishedMsg{err: fmt.Errorf("commit %s: %w", sha, err), syncedCount: synced}
-			}
-			cm.add(sha, encSHA)
-			synced++
-		}
-
-		if err := cm.save(); err != nil {
-			return syncFinishedMsg{err: fmt.Errorf("save commit-map: %w", err), syncedCount: synced}
-		}
-
-		return syncFinishedMsg{syncedCount: synced}
+		return <-ch
 	}
+}
+
+// runSyncWithChannel runs the sync loop in a goroutine and sends progress then
+// finished on ch. The UI waits on ch and refreshes panels on each progress message.
+// When syncPaused is true, the loop blocks on syncResumeCh until the user resumes.
+func runSyncWithChannel(ch chan tea.Msg) {
+	syncPauseMu.Lock()
+	syncResumeCh = make(chan struct{}, 1)
+	syncPaused = false
+	syncPauseMu.Unlock()
+	defer func() {
+		syncPauseMu.Lock()
+		syncResumeCh = nil
+		syncPauseMu.Unlock()
+	}()
+
+	startTime := time.Now()
+	pubKey := getPublicKey(currentKeyPath())
+	if pubKey == "" {
+		ch <- syncFinishedMsg{err: fmt.Errorf("no public key found in %s", currentKeyPath())}
+		return
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		ch <- syncFinishedMsg{err: fmt.Errorf("load config: %w", err)}
+		return
+	}
+	cm := loadCommitMap(commitMapPath())
+
+	out, err := loggedCommand("git", "log", "--format=%H", "--reverse").Output()
+	if err != nil {
+		ch <- syncFinishedMsg{err: fmt.Errorf("git log: %w", err)}
+		return
+	}
+
+	allSHAs := splitNonEmpty(string(out))
+	var toSync []string
+	for _, sha := range allSHAs {
+		if !cm.isSynced(sha) {
+			toSync = append(toSync, sha)
+		}
+	}
+	total := len(toSync)
+
+	absEncRepo, err := filepath.Abs(encryptedRepoPath())
+	if err != nil {
+		ch <- syncFinishedMsg{err: fmt.Errorf("resolve encrypted repo path: %w", err)}
+		return
+	}
+
+	synced := 0
+	for _, sha := range toSync {
+		encSHA, err := syncOneCommit(sha, absEncRepo, pubKey, cm, cfg.ExcludePatterns)
+		if err != nil {
+			cm.save()
+			ch <- syncFinishedMsg{err: fmt.Errorf("commit %s: %w", sha, err), syncedCount: synced}
+			return
+		}
+		cm.add(sha, encSHA)
+		synced++
+		if err := cm.save(); err != nil {
+			ch <- syncFinishedMsg{err: fmt.Errorf("save commit-map: %w", err), syncedCount: synced}
+			return
+		}
+		ch <- syncProgressMsg{NextCh: ch, Synced: synced, Total: total, StartTime: startTime}
+
+		syncPauseMu.Lock()
+		for syncPaused {
+			resumeCh := syncResumeCh
+			syncPauseMu.Unlock()
+			if resumeCh != nil {
+				<-resumeCh
+			}
+			syncPauseMu.Lock()
+		}
+		syncPauseMu.Unlock()
+	}
+
+	ch <- syncFinishedMsg{syncedCount: synced}
+}
+
+func (m model) performSync() tea.Cmd {
+	ch := make(chan tea.Msg, 8)
+	go runSyncWithChannel(ch)
+	return waitForSyncMsg(ch)
 }
 
 // commitMetaInfo holds author, committer, and date information extracted from a git commit.
@@ -1656,6 +1768,42 @@ func (m model) performRekey() tea.Cmd {
 
 // --- Utility ---
 
+// formatSyncProgress returns a status line for the footer during sync, with ETA when possible.
+func formatSyncProgress(synced, total int, startTime time.Time) string {
+	base := fmt.Sprintf("Syncing %d/%d", synced, total)
+	if total == 0 || synced >= total {
+		return base
+	}
+	elapsed := time.Since(startTime)
+	if synced <= 0 || elapsed <= 0 {
+		return base
+	}
+	rate := elapsed / time.Duration(synced)
+	remaining := total - synced
+	eta := rate * time.Duration(remaining)
+	if eta < time.Second {
+		return base + " (~1s left)"
+	}
+	return base + fmt.Sprintf(" (~%s left)", formatDuration(eta))
+}
+
+// formatDuration formats d in a compact human form (e.g. "2m3s", "1h0m").
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+	if h > 0 {
+		return fmt.Sprintf("%dh%dm", h, m)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm%ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
 // splitNonEmpty splits a string by newlines and returns only non-empty entries.
 func splitNonEmpty(s string) []string {
 	var result []string
@@ -2106,6 +2254,7 @@ func (m model) renderFooter() string {
 	keys := []string{
 		cyanStyle.Render("[i]") + "nit",
 		cyanStyle.Render("[s]") + "ync",
+		cyanStyle.Render("[P]") + "ause",
 		cyanStyle.Render("[p]") + "ush",
 		cyanStyle.Render("[e]") + " remote",
 		cyanStyle.Render("[D]") + "ecrypt",
@@ -2164,6 +2313,7 @@ func (m model) renderHelp() string {
 	b.WriteString(boldStyle.Render("  Sender workflow:") + "\n")
 	b.WriteString(fmt.Sprintf("    %s  Initialize lazycrypt in current repo\n", cyanStyle.Render("i")))
 	b.WriteString(fmt.Sprintf("    %s  Sync plaintext commits to encrypted mirror\n", cyanStyle.Render("s")))
+	b.WriteString(fmt.Sprintf("    %s  Pause or resume sync (while syncing)\n", cyanStyle.Render("P")))
 	b.WriteString(fmt.Sprintf("    %s  Push encrypted repo to remote (force)\n", cyanStyle.Render("p")))
 	b.WriteString(fmt.Sprintf("    %s  Configure encrypted remote (name + URL)\n", cyanStyle.Render("e")))
 	b.WriteString(fmt.Sprintf("    %s  Re-key (press twice to confirm)\n", cyanStyle.Render("R")))
