@@ -1149,8 +1149,9 @@ func (m model) performSync() tea.Cmd {
 // commitMetaInfo holds author, committer, and date information extracted from a git commit.
 type commitMetaInfo struct {
 	message        string
-	author         string
-	date           string
+	authorName     string
+	authorEmail    string
+	authorDate     string
 	committerName  string
 	committerEmail string
 	committerDate  string
@@ -1159,28 +1160,33 @@ type commitMetaInfo struct {
 // getCommitMetaInfo extracts commit message, author, committer, and date from
 // a commit in a single git call, optionally in a specific repo.
 func getCommitMetaInfo(sha string, repoArgs ...string) (commitMetaInfo, error) {
-	format := "%s%x00%an <%ae>%x00%ai%x00%cn%x00%ce%x00%ci"
+	// format: message, authorName, authorEmail, authorDate (ISO 8601), committerName, committerEmail, committerDate (ISO 8601)
+	format := "%B%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI"
 	args := append([]string{}, repoArgs...)
 	args = append(args, "log", "-1", "--format="+format, sha)
 	out, err := loggedCommand("git", args...).Output()
 	if err != nil {
 		return commitMetaInfo{}, fmt.Errorf("git log metadata for %s: %w", sha, err)
 	}
-	parts := strings.SplitN(strings.TrimRight(string(out), "\n"), "\x00", 6)
-	if len(parts) < 6 {
-		return commitMetaInfo{}, fmt.Errorf("unexpected git log output for %s: got %d fields, want 6", sha, len(parts))
+	parts := strings.SplitN(string(out), "\x00", 7)
+	if len(parts) < 7 {
+		return commitMetaInfo{}, fmt.Errorf("unexpected git log output for %s: got %d fields, want 7", sha, len(parts))
 	}
 	msg := parts[0]
 	if msg == "" {
 		msg = "(no message)"
 	}
+	// The last field (parts[6]) is the committer date, which will have a trailing newline
+	// added by git log. We strip it here.
+	committerDate := strings.TrimRight(parts[6], "\n")
 	return commitMetaInfo{
 		message:        msg,
-		author:         parts[1],
-		date:           parts[2],
-		committerName:  parts[3],
-		committerEmail: parts[4],
-		committerDate:  parts[5],
+		authorName:     parts[1],
+		authorEmail:    parts[2],
+		authorDate:     parts[3],
+		committerName:  parts[4],
+		committerEmail: parts[5],
+		committerDate:  committerDate,
 	}, nil
 }
 
@@ -1209,19 +1215,29 @@ func gitCommitInRepo(workDir, gitDir string, meta commitMetaInfo, envExtra ...st
 		env = append(env, "GIT_COMMITTER_DATE="+meta.committerDate)
 	}
 
-	addArgs := []string{"--git-dir=" + absGitDir, "--work-tree=" + absWorkDir, "add", "-A"}
-	addCmd := loggedCommand("git", addArgs...)
+	msgFile, err := os.CreateTemp("", "lazycrypt-msg-")
+	if err != nil {
+		return "", fmt.Errorf("create msg temp file: %w", err)
+	}
+	defer os.Remove(msgFile.Name())
+	if _, err := msgFile.WriteString(meta.message); err != nil {
+		return "", fmt.Errorf("write msg temp file: %w", err)
+	}
+	msgFile.Close()
+
+	// Stage all changes (adds + modifications + deletions) before committing.
+	addCmd := loggedCommand("git", "--git-dir="+absGitDir, "--work-tree="+absWorkDir, "add", "-A")
 	addCmd.Env = env
 	if out, err := addCmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git add: %s: %w", string(out), err)
+		return "", fmt.Errorf("git add -A: %s: %w", string(out), err)
 	}
 
-	commitArgs := []string{"--git-dir=" + absGitDir, "--work-tree=" + absWorkDir, "commit", "--allow-empty", "-m", meta.message}
-	if meta.author != "" {
-		commitArgs = append(commitArgs, "--author", meta.author)
+	commitArgs := []string{"--git-dir=" + absGitDir, "--work-tree=" + absWorkDir, "commit", "--allow-empty", "--no-gpg-sign", "-F", msgFile.Name()}
+	if meta.authorName != "" && meta.authorEmail != "" {
+		commitArgs = append(commitArgs, "--author", fmt.Sprintf("%s <%s>", meta.authorName, meta.authorEmail))
 	}
-	if meta.date != "" {
-		commitArgs = append(commitArgs, "--date", meta.date)
+	if meta.authorDate != "" {
+		commitArgs = append(commitArgs, "--date", meta.authorDate)
 	}
 	commitCmd := loggedCommand("git", commitArgs...)
 	commitCmd.Env = env
@@ -1506,7 +1522,6 @@ func decryptOneCommit(encSHA, encRepoPath, keyPath, repoPath string) (string, er
 	if err != nil {
 		return "", fmt.Errorf("diff-tree: %w", err)
 	}
-
 	// Phase 1: decrypt all files into memory before touching the working directory.
 	type pendingFile struct {
 		path    string
@@ -1583,12 +1598,22 @@ func decryptOneCommit(encSHA, encRepoPath, keyPath, repoPath string) (string, er
 		commitEnv = append(commitEnv, "GIT_COMMITTER_DATE="+meta.committerDate)
 	}
 
-	commitArgs := []string{"-C", repoPath, "commit", "--allow-empty", "-m", meta.message}
-	if meta.author != "" {
-		commitArgs = append(commitArgs, "--author", meta.author)
+	msgFile, err := os.CreateTemp("", "lazycrypt-msg-")
+	if err != nil {
+		return "", fmt.Errorf("create msg temp file: %w", err)
 	}
-	if meta.date != "" {
-		commitArgs = append(commitArgs, "--date", meta.date)
+	defer os.Remove(msgFile.Name())
+	if _, err := msgFile.WriteString(meta.message); err != nil {
+		return "", fmt.Errorf("write msg temp file: %w", err)
+	}
+	msgFile.Close()
+
+	commitArgs := []string{"-C", repoPath, "commit", "--allow-empty", "--no-gpg-sign", "-F", msgFile.Name()}
+	if meta.authorName != "" && meta.authorEmail != "" {
+		commitArgs = append(commitArgs, "--author", fmt.Sprintf("%s <%s>", meta.authorName, meta.authorEmail))
+	}
+	if meta.authorDate != "" {
+		commitArgs = append(commitArgs, "--date", meta.authorDate)
 	}
 	commitCmd := loggedCommand("git", commitArgs...)
 	commitCmd.Env = append(os.Environ(), commitEnv...)
