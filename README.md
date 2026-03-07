@@ -69,13 +69,16 @@ All of this wrapped in a lazygit-style TUI so you never have to remember the rig
 - **Dual git histories**: plaintext (local) and encrypted (remote) repos managed side-by-side
 - **age encryption**: every file encrypted per-commit using [age](https://github.com/FiloSottile/age)
 - **One-key init**: press `i` to create `.lazycrypt/`, generate an age key, and init the encrypted bare repo
-- **Incremental sync**: press `s` to encrypt new commits, tracked via a commit-map
+- **Incremental sync**: press `s` to encrypt new commits, tracked via a commit-map. Progress is saved after each commit so interrupted syncs resume where they left off
+- **Pause/resume sync**: press `P` during sync to pause, press `P` again to resume. The status bar shows real-time progress with ETA
 - **Trivial re-keying**: press `R` twice to generate a new key and rebuild the entire encrypted history
 - **Push to untrusted remotes**: press `p` to push the encrypted repo (e.g. to GitHub or any remote)
-- **lazygit-style TUI**: panel-based layout with keyboard navigation (tab, j/k, arrows)
+- **lazygit-style TUI**: panel-based layout with keyboard navigation (tab, j/k, arrows). Panels display total and unsynced commit counts
 - **Commit-level mapping**: each plaintext commit maps 1:1 to an encrypted commit
 - **Exclude patterns**: skip binary or large files from encryption via config
+- **Spaces and submodules**: file paths with spaces are handled correctly; submodule entries are safely skipped
 - **No custom git filters**: works with standard git and age CLI tools
+- **CI**: GitHub Actions workflow runs unit and integration tests on every push and pull request
 
 ## Tutorials
 
@@ -106,7 +109,7 @@ Step by step:
 6. Press `p` to push the encrypted repo to the remote
 7. Repeat steps 5-6 as you make new commits
 
-Each sync is incremental: only new commits are encrypted. The commit-map tracks which plaintext commits have been synced.
+Each sync is incremental: only new commits are encrypted. The commit-map is saved after each commit, so interrupted or paused syncs resume where they left off. Press `P` to pause/resume a running sync.
 
 To share access with a receiver, send them:
 
@@ -205,6 +208,7 @@ lazycrypt
 | `j`/`k` or arrows | Navigate within panel                                           |
 | `i`            | Init lazycrypt (create `.lazycrypt/`, generate age key, init bare repo) |
 | `s`            | Sync new plaintext commits to encrypted mirror                      |
+| `P`            | Pause / resume an in-progress sync                                  |
 | `e`            | Configure encrypted remote (name + URL)                             |
 | `p`            | Push encrypted repo to remote                                       |
 | `D`            | Pull & decrypt (receiver workflow)                                  |
@@ -215,13 +219,13 @@ lazycrypt
 
 ### Panels
 
-| Panel              | Content                                            |
-|--------------------|----------------------------------------------------|
-| Plaintext Commits  | Plaintext commit history with sync status (v / ~)  |
-| Encrypted Commits  | Encrypted commit history + pending count            |
-| Files              | Files changed in selected commit                    |
-| Keys               | age keys (current + retired)                        |
-| Remotes            | Configured plaintext / encrypted remotes            |
+| Panel              | Content                                                         |
+|--------------------|-----------------------------------------------------------------|
+| Plaintext Commits  | Plaintext commit history with sync status (v / ~) and total count |
+| Encrypted Commits  | Encrypted commit history with total and unsynced counts           |
+| Files              | Files changed in selected commit                                  |
+| Keys               | age keys (current + retired)                                      |
+| Remotes            | Configured plaintext / encrypted remotes                          |
 
 ### Storage layout
 
@@ -273,7 +277,7 @@ Lazycrypt is a single-file Go application (`main.go`). This is intentional: the 
 
 | Section | Description |
 |---------|-------------|
-| Data types | `Config`, `Commit`, `FileChange`, `Key`, `Remote`, `PrereqStatus`, `CommitMap` |
+| Data types | `Config`, `Commit`, `FileChange`, `Key`, `Remote`, `PrereqStatus`, `CommitMap`, `commitMetaInfo` |
 | Path helpers | Functions returning `.lazycrypt/` subdirectory paths |
 | Git helpers | Read-only queries against the plaintext and encrypted repos |
 | Age helpers | `ageEncrypt` and `ageDecrypt` thin wrappers around the `age` CLI |
@@ -334,8 +338,10 @@ make build
 
 ### Testing
 
+Unit and integration tests run automatically via GitHub Actions on every push and pull request to `main`.
+
 ```bash
-# Run all tests
+# Run all tests (unit + integration)
 make test
 
 # Run tests with coverage report
@@ -344,6 +350,8 @@ make coverage
 # Run linter
 make lint
 ```
+
+The integration test suite exercises the full sender-receiver workflow: init, sync, push, pull, and decrypt in isolated temporary repos.
 
 ### Guidelines
 
